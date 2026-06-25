@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>3D Driver Visualizer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #050508; overflow: hidden; font-family: 'Courier New', monospace; }
+  #canvas { display: block; width: 100vw; height: 100vh; }
+
+  #ui {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    padding: 12px 16px 20px;
+    background: linear-gradient(transparent, #050508cc 30%, #050508);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    pointer-events: none;
+  }
+  #tabs {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: center;
+    pointer-events: all;
+  }
+  .tab {
+    padding: 5px 12px;
+    background: transparent;
+    border: 1px solid #2a2a3a;
+    color: #555;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    font-family: 'Courier New', monospace;
+    transition: all 0.2s;
+  }
+  .tab.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-bg);
+  }
+  #meters {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+  }
+  .meter {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+  }
+  .meter-label { font-size: 8px; color: #444; letter-spacing: 0.15em; }
+  .meter-val { font-size: 12px; color: #888; transition: color 0.3s; }
+  #startBtn {
+    padding: 10px 28px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    letter-spacing: 0.25em;
+    font-family: 'Courier New', monospace;
+    transition: all 0.2s;
+    pointer-events: all;
+    text-transform: uppercase;
+  }
+  #info {
+    position: fixed;
+    top: 16px;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 9px;
+    color: #333;
+    letter-spacing: 0.2em;
+    pointer-events: none;
+  }
+  #title {
+    position: fixed;
+    top: 28px;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 14px;
+    letter-spacing: 0.2em;
+    pointer-events: none;
+    transition: color 0.4s;
+  }
+  #errMsg {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%,-50%);
+    color: #e05050;
+    font-size: 12px;
+    text-align: center;
+    display: none;
+  }
+  #hint { font-size: 9px; color: #333; letter-spacing: 0.1em; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="info">TRANSDUCER SIMULATION SYSTEM v3</div>
+<div id="title">AUDIO DRIVER VISUALIZER</div>
+<div id="errMsg"></div>
+
+<div id="ui">
+  <div id="tabs"></div>
+  <div id="meters">
+    <div class="meter">
+      <div class="meter-label">LEVEL</div>
+      <div class="meter-val" id="mDb">-60dB</div>
+    </div>
+    <div class="meter">
+      <div class="meter-label">FREQ</div>
+      <div class="meter-val" id="mFreq">---Hz</div>
+    </div>
+    <div class="meter">
+      <div class="meter-label">EXCURSION</div>
+      <div class="meter-val" id="mExc">0.00mm</div>
+    </div>
+  </div>
+  <button id="startBtn">▶ START MIC</button>
+  <div id="hint">マイクを許可してリアルタイム可視化</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// ========================
+// DRIVER CONFIG
+// ========================
+const DRIVERS = {
+  dynamic: { label:"ダイナミック", accent:"#c4a35a", excMult:1.0, fs:80, dampRatio:0.3 },
+  ba:      { label:"BA",          accent:"#5a9ab8", excMult:0.15, fs:1200, dampRatio:0.6 },
+  planar:  { label:"平面駆動",    accent:"#5a9850", excMult:0.3, fs:400, dampRatio:0.45 },
+  estat:   { label:"静電型",      accent:"#9850a0", excMult:0.1, fs:2000, dampRatio:0.7 },
+};
+
+let selectedKey = "dynamic";
+let excursion = 0, excVel = 0, amplitude = 0;
+let bassAmp = 0, midAmp = 0;
+let isListening = false;
+let audioCtx = null, analyser = null, audioSource = null, stream = null;
+let animId = null;
+
+// ========================
+// THREE.JS SETUP
+// ========================
+const canvas = document.getElementById("canvas");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.4;
+renderer.outputEncoding = THREE.sRGBEncoding;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x040408);
+scene.fog = new THREE.FogExp2(0x040408, 0.18);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 100);
+camera.position.set(0, 0.5, 4.2);
+camera.lookAt(0, 0, 0);
+
+const controls = new THREE.OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 1.5;
+controls.maxDistance = 10;
+
+window.addEventListener("resize", () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// ========================
+// LIGHTING
+// ========================
+// Ambient
+scene.add(new THREE.AmbientLight(0x334466, 2.5));
+
+// Key light (top-left, warm)
+const keyLight = new THREE.DirectionalLight(0xfff0d0, 5.0);
+keyLight.position.set(-3, 4, 3);
+keyLight.castShadow = true;
+keyLight.shadow.mapSize.width = 1024;
+keyLight.shadow.mapSize.height = 1024;
+scene.add(keyLight);
+
+// Fill light (right, cool)
+const fillLight = new THREE.DirectionalLight(0xd0e0ff, 2.5);
+fillLight.position.set(4, 1, 2);
+scene.add(fillLight);
+
+// Rim light (back)
+const rimLight = new THREE.DirectionalLight(0xffffff, 2.5);
+rimLight.position.set(0, -2, -4);
+scene.add(rimLight);
+
+// Front fill
+const frontLight = new THREE.DirectionalLight(0xffffff, 1.5);
+frontLight.position.set(0, 0, 5);
+scene.add(frontLight);
+
+// Accent point light (changes with driver)
+const accentLight = new THREE.PointLight(0xc4a35a, 0, 3);
+accentLight.position.set(0, 0, 1.5);
+scene.add(accentLight);
+
+// Bottom bounce
+const bounceLight = new THREE.PointLight(0x2030ff, 0.3, 5);
+bounceLight.position.set(0, -3, 0);
+scene.add(bounceLight);
+
+// ========================
+// MATERIALS
+// ========================
+function makeMetal(color, roughness=0.2, metalness=1.0) {
+  return new THREE.MeshStandardMaterial({ color, roughness, metalness });
+}
+function makeRubber(color, roughness=0.9) {
+  return new THREE.MeshStandardMaterial({ color, roughness, metalness: 0.0 });
+}
+function makeGlass(color, opacity=0.3) {
+  return new THREE.MeshStandardMaterial({ color, roughness: 0.05, metalness: 0.1, transparent: true, opacity, side: THREE.DoubleSide });
+}
+
+const matMagnet     = makeMetal(0x1a1a24, 0.3, 0.95);
+const matPoleTop    = makeMetal(0x505060, 0.15, 1.0);
+const matPoleCenter = makeMetal(0x606070, 0.1, 1.0);
+const matVC         = makeMetal(0xc87820, 0.25, 0.9);
+const matVCFormer   = makeMetal(0x1a1010, 0.7, 0.3);
+const matCone       = new THREE.MeshStandardMaterial({ color: 0xb89858, roughness: 0.75, metalness: 0.0, side: THREE.DoubleSide });
+const matDustcap    = new THREE.MeshStandardMaterial({ color: 0xc8a868, roughness: 0.65, metalness: 0.05 });
+const matSurround   = makeRubber(0x1a1a1a, 0.95);
+const matBasket     = makeMetal(0x2a2a30, 0.45, 0.85);
+const matSpider     = makeRubber(0x2a1a0a, 0.85);
+const matGlowRing   = new THREE.MeshStandardMaterial({ color: 0xc4a35a, roughness: 0.3, metalness: 0.5, emissive: 0xc4a35a, emissiveIntensity: 0 });
+
+// Floor reflector
+const floorGeo = new THREE.PlaneGeometry(20, 20);
+const floorMat = new THREE.MeshStandardMaterial({ color: 0x080810, roughness: 0.1, metalness: 0.8 });
+const floor = new THREE.Mesh(floorGeo, floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -2.2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// ========================
+// DRIVER GEOMETRY GROUP
+// ========================
+const driverGroup = new THREE.Group();
+driverGroup.rotation.x = Math.PI / 2; // rotate so cone faces camera
+scene.add(driverGroup);
+
+let driverMeshes = {};
+
+function buildDynamicDriver() {
+  // Clear
+  while (driverGroup.children.length) driverGroup.remove(driverGroup.children[0]);
+  driverMeshes = {};
+
+  const r32 = Math.PI * 2;
+
+  // --- BASKET (outer ring) ---
+  const basketRingGeo = new THREE.TorusGeometry(1.05, 0.06, 10, 64);
+  const basketRing = new THREE.Mesh(basketRingGeo, matBasket);
+  basketRing.rotation.x = Math.PI / 2; // fix: lay flat
+  basketRing.castShadow = true;
+  driverGroup.add(basketRing);
+
+  // Basket lip (flat ring)
+  const basketLipGeo = new THREE.RingGeometry(0.98, 1.11, 64);
+  const basketLip = new THREE.Mesh(basketLipGeo, matBasket);
+  basketLip.rotation.x = -Math.PI / 2;
+  basketLip.position.y = 0;
+  basketLip.castShadow = true;
+  driverGroup.add(basketLip);
+
+  // Basket spokes (vertical pillars from rim to magnet)
+  for (let i = 0; i < 6; i++) {
+    const angle = (i / 6) * Math.PI * 2;
+    const rx = Math.cos(angle) * 0.75;
+    const rz = Math.sin(angle) * 0.75;
+    const spokeGeo = new THREE.CylinderGeometry(0.018, 0.018, 1.2, 6);
+    const spoke = new THREE.Mesh(spokeGeo, matBasket);
+    spoke.position.set(rx, -0.6, rz);
+    spoke.castShadow = true;
+    driverGroup.add(spoke);
+  }
+
+  // --- SURROUND ---
+  const surroundGeo = new THREE.TorusGeometry(1.0, 0.09, 18, 96);
+  const surround = new THREE.Mesh(surroundGeo, matSurround);
+  surround.rotation.x = Math.PI / 2; // fix: lay flat
+  surround.castShadow = true;
+  driverGroup.add(surround);
+  driverMeshes.surround = surround;
+
+  // Inner surround ring connection
+  const innerRingGeo = new THREE.TorusGeometry(0.91, 0.015, 8, 64);
+  const innerRing = new THREE.Mesh(innerRingGeo, matSurround);
+  innerRing.rotation.x = Math.PI / 2; // fix: lay flat
+  driverGroup.add(innerRing);
+  driverMeshes.innerRing = innerRing;
+
+  // --- CONE ---
+  // Build cone using lathe geometry for smooth curvature
+  const conePoints = [];
+  const coneSegs = 28;
+  for (let i = 0; i <= coneSegs; i++) {
+    const t = i / coneSegs;
+    const r = 0.91 - t * 0.78; // outer rim to center
+    // Slight curve (parabolic)
+    const y = -t * 0.65 - t * t * 0.12;
+    conePoints.push(new THREE.Vector2(r, y));
+  }
+  const coneGeo = new THREE.LatheGeometry(conePoints, 80);
+  const cone = new THREE.Mesh(coneGeo, matCone);
+  cone.castShadow = true;
+  cone.receiveShadow = true;
+  driverGroup.add(cone);
+  driverMeshes.cone = cone;
+
+  // Cone ribs (concentric rings on cone surface)
+  for (let i = 1; i <= 4; i++) {
+    const t = i / 5;
+    const r = 0.91 - t * 0.78;
+    const y = -t * 0.65 - t * t * 0.12;
+    const ribGeo = new THREE.TorusGeometry(r, 0.006, 6, 48);
+    const rib = new THREE.Mesh(ribGeo, makeMetal(0x8a7040, 0.6, 0.2));
+    rib.rotation.x = Math.PI / 2; // fix: lay flat
+    rib.position.y = y;
+    driverGroup.add(rib);
+    driverMeshes[`rib${i}`] = rib;
+  }
+
+  // --- DUSTCAP ---
+  const dustcapPoints = [];
+  const dcSegs = 20;
+  for (let i = 0; i <= dcSegs; i++) {
+    const t = i / dcSegs;
+    const r = t * 0.135;
+    const y = -0.77 + (1 - t * t) * 0.08; // slight dome
+    dustcapPoints.push(new THREE.Vector2(r, y));
+  }
+  const dustcapGeo = new THREE.LatheGeometry(dustcapPoints, 48);
+  const dustcap = new THREE.Mesh(dustcapGeo, matDustcap);
+  dustcap.castShadow = true;
+  driverGroup.add(dustcap);
+  driverMeshes.dustcap = dustcap;
+
+  // Dustcap rim ring
+  const dcRimGeo = new THREE.TorusGeometry(0.132, 0.008, 8, 48);
+  const dcRim = new THREE.Mesh(dcRimGeo, makeMetal(0x9a8050, 0.3, 0.7));
+  dcRim.rotation.x = Math.PI / 2; // fix: lay flat
+  dcRim.position.y = -0.77;
+  driverGroup.add(dcRim);
+  driverMeshes.dcRim = dcRim;
+
+  // --- SPIDER ---
+  const spiderPoints = [];
+  for (let i = 0; i <= 32; i++) {
+    const t = i / 32;
+    const r = t * 0.7;
+    const wave = Math.sin(t * Math.PI * 5) * 0.04;
+    const y = -0.82 + wave;
+    spiderPoints.push(new THREE.Vector2(r, y));
+  }
+  const spiderGeo = new THREE.LatheGeometry(spiderPoints, 64);
+  const spider = new THREE.Mesh(spiderGeo, matSpider);
+  spider.castShadow = true;
+  driverGroup.add(spider);
+  driverMeshes.spider = spider;
+
+  // --- VOICE COIL ---
+  // VC former
+  const vcFormerGeo = new THREE.CylinderGeometry(0.135, 0.135, 0.35, 48, 1, true);
+  const vcFormer = new THREE.Mesh(vcFormerGeo, matVCFormer);
+  vcFormer.position.y = -0.95;
+  vcFormer.castShadow = true;
+  driverGroup.add(vcFormer);
+  driverMeshes.vcFormer = vcFormer;
+
+  // VC windings (stacked rings)
+  const vcWindingGroup = new THREE.Group();
+  for (let i = 0; i < 8; i++) {
+    const windGeo = new THREE.TorusGeometry(0.14, 0.012, 8, 48);
+    const winding = new THREE.Mesh(windGeo, matVC);
+    winding.rotation.x = Math.PI / 2; // fix: lay flat
+    winding.position.y = -0.82 - i * 0.03;
+    winding.castShadow = true;
+    vcWindingGroup.add(winding);
+  }
+  driverGroup.add(vcWindingGroup);
+  driverMeshes.vcWindings = vcWindingGroup;
+
+  // --- MAGNET ASSEMBLY ---
+  // Top pole plate
+  const topPlateGeo = new THREE.CylinderGeometry(0.52, 0.52, 0.055, 64);
+  const topPlate = new THREE.Mesh(topPlateGeo, matPoleTop);
+  topPlate.position.y = -1.18;
+  topPlate.castShadow = true;
+  driverGroup.add(topPlate);
+
+  // Gap ring glow
+  const gapGeo = new THREE.TorusGeometry(0.145, 0.02, 8, 48);
+  const gapRing = new THREE.Mesh(gapGeo, matGlowRing);
+  gapRing.rotation.x = Math.PI / 2; // fix: lay flat
+  gapRing.position.y = -1.18;
+  driverGroup.add(gapRing);
+  driverMeshes.gapRing = gapRing;
+
+  // Magnet body (cylinder)
+  const magnetGeo = new THREE.CylinderGeometry(0.44, 0.44, 0.32, 64);
+  const magnet = new THREE.Mesh(magnetGeo, matMagnet);
+  magnet.position.y = -1.36;
+  magnet.castShadow = true;
+  driverGroup.add(magnet);
+
+  // Magnet highlight ring
+  const magHLGeo = new THREE.TorusGeometry(0.44, 0.008, 8, 64);
+  const magHL = new THREE.Mesh(magHLGeo, makeMetal(0x6060a0, 0.1, 1.0));
+  magHL.rotation.x = Math.PI / 2; // fix: lay flat
+  magHL.position.y = -1.22;
+  driverGroup.add(magHL);
+
+  // Bottom pole plate
+  const botPlateGeo = new THREE.CylinderGeometry(0.52, 0.52, 0.055, 64);
+  const botPlate = new THREE.Mesh(botPlateGeo, matPoleTop);
+  botPlate.position.y = -1.52;
+  botPlate.castShadow = true;
+  driverGroup.add(botPlate);
+
+  // Center pole piece
+  const centerPoleGeo = new THREE.CylinderGeometry(0.13, 0.13, 0.38, 32);
+  const centerPole = new THREE.Mesh(centerPoleGeo, matPoleCenter);
+  centerPole.position.y = -1.34;
+  centerPole.castShadow = true;
+  driverGroup.add(centerPole);
+
+  // Pole top dome
+  const poleDomeGeo = new THREE.SphereGeometry(0.13, 24, 12, 0, Math.PI*2, 0, Math.PI/2);
+  const poleDome = new THREE.Mesh(poleDomeGeo, matPoleCenter);
+  poleDome.position.y = -1.16;
+  driverGroup.add(poleDome);
+
+  // Glow ring around gap (accent light)
+  const glowRingGeo = new THREE.TorusGeometry(0.16, 0.01, 8, 64);
+  const glowRingMat = new THREE.MeshStandardMaterial({ color: 0xc4a35a, emissive: 0xc4a35a, emissiveIntensity: 0.5, roughness: 0.3 });
+  const glowRing = new THREE.Mesh(glowRingGeo, glowRingMat);
+  glowRing.rotation.x = Math.PI / 2; // fix: lay flat
+  glowRing.position.y = -1.18;
+  driverGroup.add(glowRing);
+  driverMeshes.glowRing = glowRing;
+  driverMeshes.glowRingMat = glowRingMat;
+
+  // --- MOVING GROUP (cone + dustcap + vc + spider) ---
+  // We'll animate by moving Y position
+  driverMeshes.movingParts = [
+    cone, dustcap, dcRim, vcFormer, vcWindingGroup, spider,
+    innerRing,
+    ...Object.keys(driverMeshes).filter(k => k.startsWith("rib")).map(k => driverMeshes[k])
+  ];
+
+  // Camera target
+  camera.position.set(0, 0.5, 4.2);
+  camera.lookAt(0, 0, 0);
+}
+
+function buildBADriver() {
+  while (driverGroup.children.length) driverGroup.remove(driverGroup.children[0]);
+  driverMeshes = {};
+
+  // Housing shell
+  const housingGeo = new THREE.BoxGeometry(2.4, 1.8, 1.2);
+  const housingMat = makeMetal(0x0e1218, 0.4, 0.7);
+  const housing = new THREE.Mesh(housingGeo, housingMat);
+  housing.castShadow = true;
+  driverGroup.add(housing);
+
+  // Housing edges highlight
+  const edgesGeo = new THREE.EdgesGeometry(housingGeo);
+  const edgesMat = new THREE.LineBasicMaterial({ color: 0x3a4858, opacity: 0.6, transparent: true });
+  driverGroup.add(new THREE.LineSegments(edgesGeo, edgesMat));
+
+  // Top magnet
+  const mag1Geo = new THREE.BoxGeometry(1.6, 0.35, 0.9);
+  const mag1 = new THREE.Mesh(mag1Geo, matMagnet);
+  mag1.position.y = 0.45;
+  mag1.castShadow = true;
+  driverGroup.add(mag1);
+  // Magnet highlight
+  const mag1HLGeo = new THREE.BoxGeometry(1.6, 0.04, 0.9);
+  const mag1HL = new THREE.Mesh(mag1HLGeo, makeMetal(0x6060c0, 0.1, 1.0));
+  mag1HL.position.y = 0.63;
+  driverGroup.add(mag1HL);
+
+  // Bottom magnet
+  const mag2Geo = new THREE.BoxGeometry(1.6, 0.35, 0.9);
+  const mag2 = new THREE.Mesh(mag2Geo, matMagnet);
+  mag2.position.y = -0.45;
+  mag2.castShadow = true;
+  driverGroup.add(mag2);
+
+  // Armature reed
+  const armGeo = new THREE.BoxGeometry(2.0, 0.12, 0.3);
+  const armMat = makeMetal(0x888898, 0.2, 1.0);
+  const arm = new THREE.Mesh(armGeo, armMat);
+  arm.castShadow = true;
+  driverGroup.add(arm);
+  driverMeshes.arm = arm;
+
+  // Armature highlight
+  const armHLGeo = new THREE.BoxGeometry(2.0, 0.02, 0.3);
+  const armHL = new THREE.Mesh(armHLGeo, makeMetal(0xffffff, 0.05, 1.0));
+  armHL.position.y = 0.07;
+  arm.add(armHL);
+
+  // Coil (rings around armature)
+  const coilGroup = new THREE.Group();
+  for (let i = -4; i <= 4; i++) {
+    const coilGeo = new THREE.TorusGeometry(0.22, 0.04, 8, 32);
+    const coil = new THREE.Mesh(coilGeo, matVC);
+    coil.rotation.y = Math.PI / 2;
+    coil.position.x = i * 0.14;
+    coilGroup.add(coil);
+  }
+  driverGroup.add(coilGroup);
+
+  // Drive rod
+  const rodGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.7, 12);
+  const rod = new THREE.Mesh(rodGeo, makeMetal(0x888888, 0.3, 0.9));
+  rod.position.x = 1.1;
+  rod.rotation.z = Math.PI / 2;
+  driverGroup.add(rod);
+  driverMeshes.rod = rod;
+
+  // Diaphragm
+  const diagPoints = [];
+  for (let i = 0; i <= 20; i++) {
+    const t = i / 20;
+    const y = t * 0.8 - 0.4;
+    const x = 0.15 + Math.sin(t * Math.PI) * 0.25;
+    diagPoints.push(new THREE.Vector2(x, y));
+  }
+  const diagGeo = new THREE.LatheGeometry(diagPoints, 32);
+  const diagMat = new THREE.MeshStandardMaterial({ color: 0x5888a8, roughness: 0.3, metalness: 0.2, side: THREE.DoubleSide, transparent: true, opacity: 0.85 });
+  const diag = new THREE.Mesh(diagGeo, diagMat);
+  diag.position.x = 1.45;
+  diag.rotation.z = Math.PI / 2;
+  diag.castShadow = true;
+  driverGroup.add(diag);
+  driverMeshes.diag = diag;
+  driverMeshes.movingParts = [arm, coilGroup, rod, diag];
+
+  camera.position.set(0, 0.5, 3.8);
+  camera.lookAt(0, 0, 0);
+}
+
+function buildPlanarDriver() {
+  while (driverGroup.children.length) driverGroup.remove(driverGroup.children[0]);
+  driverMeshes = {};
+
+  // Frame
+  const frameOuterGeo = new THREE.BoxGeometry(2.8, 2.2, 0.3);
+  const frameInnerGeo = new THREE.BoxGeometry(2.4, 1.8, 0.35);
+  const frameMat = makeMetal(0x1a1a1a, 0.5, 0.9);
+  const frame = new THREE.Mesh(frameOuterGeo, frameMat);
+  frame.castShadow = true;
+  driverGroup.add(frame);
+
+  // Magnet rows (top and bottom)
+  const cols = 7;
+  for (const side of [-1, 1]) {
+    for (let i = 0; i < cols; i++) {
+      const mx = -1.35 + i * 0.45;
+      const my = side * 0.95;
+      const magGeo = new THREE.BoxGeometry(0.35, 0.18, 0.22);
+      const magColor = side === -1 ? 0x1a1030 : 0x0a200a;
+      const mag = new THREE.Mesh(magGeo, makeMetal(magColor, 0.3, 0.9));
+      mag.position.set(mx, my, 0);
+      mag.castShadow = true;
+      driverGroup.add(mag);
+      // Pole highlight
+      const hlGeo = new THREE.BoxGeometry(0.35, 0.03, 0.22);
+      const hl = new THREE.Mesh(hlGeo, makeMetal(side===-1?0x6040a0:0x40a040, 0.1, 1.0));
+      hl.position.set(mx, my + 0.075*side, 0);
+      driverGroup.add(hl);
+    }
+  }
+
+  // Membrane (thin plane with conductor traces)
+  const memGeo = new THREE.PlaneGeometry(2.35, 1.75, 1, 1);
+  const memMat = new THREE.MeshStandardMaterial({ color: 0x90c080, roughness: 0.8, metalness: 0.0, transparent: true, opacity: 0.25, side: THREE.DoubleSide });
+  const membrane = new THREE.Mesh(memGeo, memMat);
+  driverGroup.add(membrane);
+  driverMeshes.membrane = membrane;
+
+  // Conductor traces (horizontal bars)
+  const traceGroup = new THREE.Group();
+  for (let i = 0; i < 8; i++) {
+    const y = -0.7 + i * 0.2;
+    const traceGeo = new THREE.BoxGeometry(2.2, 0.025, 0.015);
+    const trace = new THREE.Mesh(traceGeo, matVC);
+    trace.position.y = y;
+    trace.position.z = 0.001;
+    traceGroup.add(trace);
+  }
+  driverGroup.add(traceGroup);
+  driverMeshes.traceGroup = traceGroup;
+  driverMeshes.movingParts = [membrane, traceGroup];
+
+  camera.position.set(0, 0.3, 3.8);
+  camera.lookAt(0, 0, 0);
+}
+
+function buildEstatDriver() {
+  while (driverGroup.children.length) driverGroup.remove(driverGroup.children[0]);
+  driverMeshes = {};
+
+  // Stators
+  for (const side of [-1, 1]) {
+    const statorGeo = new THREE.BoxGeometry(2.8, 0.12, 2.0);
+    const stator = new THREE.Mesh(statorGeo, makeMetal(0x505060, 0.2, 0.95));
+    stator.position.y = side * 0.35;
+    stator.castShadow = true;
+    driverGroup.add(stator);
+
+    // Stator highlight
+    const stHL = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.02, 2.0), makeMetal(0xffffff, 0.05, 1.0));
+    stHL.position.y = side * 0.35 + side * 0.05;
+    driverGroup.add(stHL);
+
+    // Perforations
+    for (let i = 0; i < 8; i++) {
+      for (let j = 0; j < 5; j++) {
+        const perfGeo = new THREE.CylinderGeometry(0.06, 0.06, 0.14, 12);
+        const perf = new THREE.Mesh(perfGeo, new THREE.MeshStandardMaterial({ color: 0x000000 }));
+        perf.rotation.x = Math.PI / 2;
+        perf.position.set(-1.4 + i * 0.4 + 0.2, side * 0.35, -0.8 + j * 0.4);
+        driverGroup.add(perf);
+      }
+    }
+
+    // Connector
+    const connGeo = new THREE.BoxGeometry(0.2, 0.2, 0.12);
+    const conn = new THREE.Mesh(connGeo, makeMetal(0x404050, 0.4, 0.8));
+    conn.position.set(1.5, side * 0.35, 0);
+    driverGroup.add(conn);
+  }
+
+  // Membrane
+  const memGeo = new THREE.PlaneGeometry(2.75, 1.9, 32, 1);
+  const memMat = new THREE.MeshStandardMaterial({ color: 0xd0b0e8, roughness: 0.1, metalness: 0.0, transparent: true, opacity: 0.45, side: THREE.DoubleSide });
+  const membrane = new THREE.Mesh(memGeo, memMat);
+  membrane.rotation.x = Math.PI / 2;
+  driverGroup.add(membrane);
+  driverMeshes.membrane = membrane;
+  driverMeshes.movingParts = [membrane];
+
+  // Bias cable
+  const cableGeo = new THREE.CylinderGeometry(0.03, 0.03, 1.2, 8);
+  const cable = new THREE.Mesh(cableGeo, makeRubber(0x111111));
+  cable.position.set(1.55, 0, 0);
+  driverGroup.add(cable);
+
+  // HV label
+  camera.position.set(1.5, 1.2, 3.5);
+  camera.lookAt(0, 0, 0);
+}
+
+// ========================
+// PARTICLE SYSTEM (air pressure)
+// ========================
+const particleCount = 180;
+const particleGeo = new THREE.BufferGeometry();
+const positions = new Float32Array(particleCount * 3);
+const particleVels = [];
+for (let i = 0; i < particleCount; i++) {
+  positions[i*3] = (Math.random()-0.5)*0.3;
+  positions[i*3+1] = 0.2 + Math.random() * 0.5;
+  positions[i*3+2] = (Math.random()-0.5)*0.3;
+  particleVels.push({ vx:(Math.random()-0.5)*0.01, vy:0.01+Math.random()*0.02, vz:(Math.random()-0.5)*0.01, life:Math.random() });
+}
+particleGeo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+const particleMat = new THREE.PointsMaterial({ color: 0xc4a35a, size: 0.025, transparent: true, opacity: 0 });
+const particles = new THREE.Points(particleGeo, particleMat);
+scene.add(particles);
+
+// ========================
+// UI SETUP
+// ========================
+const tabsEl = document.getElementById("tabs");
+for (const [key, d] of Object.entries(DRIVERS)) {
+  const btn = document.createElement("button");
+  btn.className = "tab" + (key === selectedKey ? " active" : "");
+  btn.textContent = d.label;
+  btn.dataset.key = key;
+  btn.onclick = () => selectDriver(key);
+  tabsEl.appendChild(btn);
+}
+
+function selectDriver(key) {
+  selectedKey = key;
+  excursion = 0; excVel = 0;
+  const d = DRIVERS[key];
+  document.documentElement.style.setProperty("--accent", d.accent);
+  document.documentElement.style.setProperty("--accent-bg", d.accent + "22");
+  document.getElementById("title").style.color = d.accent;
+  accentLight.color.set(d.accent);
+  particleMat.color.set(d.accent);
+  matGlowRing.color.set(d.accent);
+  matGlowRing.emissive.set(d.accent);
+  for (const btn of tabsEl.querySelectorAll(".tab")) {
+    btn.classList.toggle("active", btn.dataset.key === key);
+  }
+  if (key === "dynamic") buildDynamicDriver();
+  else if (key === "ba") buildBADriver();
+  else if (key === "planar") buildPlanarDriver();
+  else if (key === "estat") buildEstatDriver();
+}
+
+// ========================
+// TOUCH ROTATION
+// ========================
+let touchStart = null;
+let rotY = 0, rotX = 0;
+let autoRotate = false;
+
+canvas.addEventListener("touchstart", e => {
+  touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, ry: rotY, rx: rotX };
+  autoRotate = false;
+  setTimeout(() => { if (!isListening) autoRotate = true; }, 4000);
+}, { passive: true });
+canvas.addEventListener("touchmove", e => {
+  if (!touchStart) return;
+  const dx = (e.touches[0].clientX - touchStart.x) * 0.008;
+  const dy = (e.touches[0].clientY - touchStart.y) * 0.005;
+  rotY = touchStart.ry + dx;
+  rotX = Math.max(-0.5, Math.min(0.5, touchStart.rx + dy));
+}, { passive: true });
+canvas.addEventListener("mousedown", e => {
+  touchStart = { x: e.clientX, y: e.clientY, ry: rotY, rx: rotX };
+  autoRotate = false;
+});
+window.addEventListener("mousemove", e => {
+  if (!touchStart || !e.buttons) return;
+  const dx = (e.clientX - touchStart.x) * 0.006;
+  const dy = (e.clientY - touchStart.y) * 0.004;
+  rotY = touchStart.ry + dx;
+  rotX = Math.max(-0.5, Math.min(0.5, touchStart.rx + dy));
+});
+window.addEventListener("mouseup", () => {
+  touchStart = null;
+  setTimeout(() => { autoRotate = true; }, 4000);
+});
+
+// ========================
+// AUDIO
+// ========================
+async function startAudio() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false } });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.8;
+    audioSource = audioCtx.createMediaStreamSource(stream);
+    audioSource.connect(analyser);
+    isListening = true;
+    const btn = document.getElementById("startBtn");
+    btn.textContent = "■ STOP";
+    btn.style.borderColor = "#e05050";
+    btn.style.color = "#e05050";
+    btn.style.background = "#1a0a0a";
+    document.getElementById("hint").style.display = "none";
+    autoRotate = false;
+  } catch(e) {
+    document.getElementById("errMsg").style.display = "block";
+    document.getElementById("errMsg").textContent = "マイクへのアクセスが許可されませんでした";
+  }
+}
+
+function stopAudio() {
+  if (audioSource) audioSource.disconnect();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+  audioCtx = null; analyser = null; audioSource = null; stream = null;
+  isListening = false;
+  excursion = 0; excVel = 0; amplitude = 0;
+  const d = DRIVERS[selectedKey];
+  const btn = document.getElementById("startBtn");
+  btn.textContent = "▶ START MIC";
+  btn.style.borderColor = d.accent;
+  btn.style.color = d.accent;
+  btn.style.background = d.accent + "18";
+  document.getElementById("hint").style.display = "";
+  document.getElementById("mDb").textContent = "-60dB";
+  document.getElementById("mFreq").textContent = "---Hz";
+  document.getElementById("mExc").textContent = "0.00mm";
+  autoRotate = true;
+}
+
+document.getElementById("startBtn").onclick = () => {
+  if (isListening) stopAudio(); else startAudio();
+};
+
+// ========================
+// RENDER LOOP
+// ========================
+const clock = new THREE.Clock();
+const freqDataArr = new Uint8Array(1024);
+const timeDataArr = new Uint8Array(1024);
+
+function animate() {
+  animId = requestAnimationFrame(animate);
+  const t = clock.getElapsedTime();
+  const dt = clock.getDelta ? 0.016 : 0.016;
+
+  // Audio analysis
+  let db = -60, domFreq = 0;
+  if (isListening && analyser) {
+    analyser.getByteTimeDomainData(timeDataArr);
+    analyser.getByteFrequencyData(freqDataArr);
+
+    let sum = 0;
+    for (let i = 0; i < timeDataArr.length; i++) {
+      const v = (timeDataArr[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / timeDataArr.length);
+    db = Math.max(-60, 20 * Math.log10(rms + 1e-10));
+
+    let maxVal = 0;
+    for (let i = 1; i < freqDataArr.length; i++) {
+      if (freqDataArr[i] > maxVal) { maxVal = freqDataArr[i]; domFreq = i; }
+    }
+    domFreq = Math.round(domFreq * (audioCtx.sampleRate / analyser.fftSize));
+
+    // Band energies
+    let bassSum = 0, bassN = 0;
+    const hzPerBin = audioCtx.sampleRate / analyser.fftSize;
+    for (let i = 1; i < freqDataArr.length; i++) {
+      if (i * hzPerBin < 300) { bassSum += freqDataArr[i]; bassN++; }
+    }
+    const newBass = bassN > 0 ? (bassSum / bassN / 255) * 3 : 0;
+    bassAmp = bassAmp * 0.7 + Math.min(1, newBass) * 0.3;
+
+    const rawAmp = Math.min(1, rms * 10);
+    amplitude = amplitude * 0.6 + rawAmp * 0.4;
+
+    // Update UI
+    document.getElementById("mDb").textContent = db.toFixed(1) + "dB";
+    document.getElementById("mDb").style.color = DRIVERS[selectedKey].accent;
+    if (amplitude > 0.04) {
+      document.getElementById("mFreq").textContent = domFreq.toLocaleString() + "Hz";
+    }
+    document.getElementById("mFreq").style.color = DRIVERS[selectedKey].accent;
+  } else {
+    amplitude = amplitude * 0.95;
+  }
+
+  // Physics
+  const drv = DRIVERS[selectedKey];
+  const freqWeight = domFreq > 0 ? Math.min(1, 200 / Math.max(50, domFreq)) : 1;
+  const target = amplitude * drv.excMult * 0.55 * (0.4 + freqWeight * 0.6);
+  excVel = excVel * (1 - drv.dampRatio * 0.12) - (excursion - target) * 0.1;
+  excursion += excVel;
+
+  const excMm = (Math.abs(excursion) * drv.excMult * 0.8).toFixed(2);
+  document.getElementById("mExc").textContent = excMm + "mm";
+  document.getElementById("mExc").style.color = DRIVERS[selectedKey].accent;
+
+  // Animate moving parts
+  const movingY = excursion * (selectedKey === "dynamic" ? 1 : 0.4);
+  if (driverMeshes.movingParts) {
+    for (const mesh of driverMeshes.movingParts) {
+      mesh.position.y = movingY + (mesh.userData.baseY || 0);
+    }
+  }
+  // Planar membrane ripple
+  if (selectedKey === "planar" && driverMeshes.membrane) {
+    const geo = driverMeshes.membrane.geometry;
+    const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i);
+      const wave = Math.sin(x * 3 + t * 8) * amplitude * 0.04;
+      pos.setZ(i, wave);
+    }
+    pos.needsUpdate = true;
+    geo.computeVertexNormals();
+  }
+  // Estat membrane ripple
+  if (selectedKey === "estat" && driverMeshes.membrane) {
+    const geo = driverMeshes.membrane.geometry;
+    const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i);
+      const wave = Math.sin(x * 4 + t * 12) * amplitude * 0.025;
+      pos.setZ(i, wave + excursion * 0.3);
+    }
+    pos.needsUpdate = true;
+    geo.computeVertexNormals();
+  }
+
+  // Gap glow
+  if (driverMeshes.glowRingMat) {
+    driverMeshes.glowRingMat.emissiveIntensity = 0.3 + amplitude * 2.5;
+  }
+  if (driverMeshes.gapRing) {
+    driverMeshes.gapRing.material.emissiveIntensity = amplitude * 1.5;
+  }
+
+  // Accent light pulse
+  accentLight.intensity = amplitude * 3.5 + bassAmp * 2;
+  accentLight.position.y = movingY + 0.8;
+
+  // Particles
+  if (amplitude > 0.08 && selectedKey === "dynamic") {
+    particleMat.opacity = amplitude * 0.7;
+    const posAttr = particleGeo.attributes.position;
+    for (let i = 0; i < particleCount; i++) {
+      particleVels[i].life += 0.015 + amplitude * 0.03;
+      if (particleVels[i].life > 1) {
+        particleVels[i].life = 0;
+        posAttr.setXYZ(i, (Math.random()-0.5)*0.4, movingY + 0.1, (Math.random()-0.5)*0.4);
+        particleVels[i].vx = (Math.random()-0.5)*0.015;
+        particleVels[i].vy = 0.012 + Math.random()*0.025;
+        particleVels[i].vz = (Math.random()-0.5)*0.015;
+      }
+      const px = posAttr.getX(i) + particleVels[i].vx;
+      const py = posAttr.getY(i) + particleVels[i].vy * amplitude * 3;
+      const pz = posAttr.getZ(i) + particleVels[i].vz;
+      posAttr.setXYZ(i, px, py, pz);
+    }
+    posAttr.needsUpdate = true;
+  } else {
+    particleMat.opacity = Math.max(0, particleMat.opacity - 0.05);
+  }
+
+  // Update OrbitControls
+  controls.update();
+
+  // Driver group rotation (OrbitControls handles camera, just keep base x rotation)
+  driverGroup.rotation.y = 0;
+  driverGroup.rotation.x = Math.PI / 2;
+
+  // Subtle idle bobbing when not playing
+  if (!isListening || amplitude < 0.05) {
+    driverGroup.position.y = Math.sin(t * 0.6) * 0.04;
+  }
+
+  renderer.render(scene, camera);
+}
+
+// Init
+selectDriver("dynamic");
+animate();
+</script>
+</body>
+</html>
